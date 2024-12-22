@@ -279,10 +279,11 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        // [BY CHENHAO]
+        // [NOTE BY CHENHAO]
         // make a copy of Arc to LsmStorageState
         // Question: does this mean state will be swapped???
         // what's the point of this rwlock?
+        // A (maybe): this Arc looks like an RCU operation: with a short lock to grab a pointer for a snapshot read
         let snapshot = Arc::clone(&self.state.read());
 
         if let Some(value) = snapshot.memtable.get(_key) {
@@ -292,7 +293,6 @@ impl LsmStorageInner {
             return Ok(Some(value));
         }
 
-        // assume imm_memtable is sorted by recency (the first is the latest)
         for memtable in snapshot.imm_memtables.iter() {
             if let Some(value) = memtable.get(_key) {
                 if value.is_empty() {
@@ -314,13 +314,22 @@ impl LsmStorageInner {
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
         let snapshot = Arc::clone(&self.state.read());
-        snapshot.memtable.put(_key, _value)
+        snapshot.memtable.put(_key, _value)?;
+
+        if snapshot.memtable.approximate_size() > self.options.target_sst_size {
+            let guard = self.state_lock.lock();
+            // check again after acquiring the lock
+            if snapshot.memtable.approximate_size() > self.options.target_sst_size {
+                self.force_freeze_memtable(&guard)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        let snapshot = Arc::clone(&self.state.read());
-        snapshot.memtable.put(_key, &[])
+        self.put(_key, &[])
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -345,7 +354,30 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        let new_id = self.next_sst_id();
+        let new_memtable = if self.options.enable_wal {
+            Arc::new(MemTable::create_with_wal(new_id, self.path_of_wal(new_id))?)
+        } else {
+            Arc::new(MemTable::create(new_id))
+        };
+
+        {
+            // [NOTE BY CHENHAO]
+            // Arc does not only provide shared immutable access; to safely modify the states in-place,
+            // we need interior mutability (e.g, another Mutex? is RefCell sufficient?)
+            // The solution here is CoW-style: create a new snapshot of state and swap Arc of that
+            // Q: What is the purpose of rwlock here then?
+            // A: Coordinate the Arc swap?
+            let mut guard = self.state.write();
+            let mut snapshot = guard.as_ref().clone();
+            let old_memtable = std::mem::replace(&mut snapshot.memtable, new_memtable);
+            // imm_memtable is ordered from latest to oldest
+            snapshot.imm_memtables.insert(0, old_memtable);
+
+            *guard = Arc::new(snapshot);
+        }
+
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
