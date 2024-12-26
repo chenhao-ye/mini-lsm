@@ -1,7 +1,9 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use anyhow::Result;
+use core::panic;
+
+use anyhow::{bail, Result};
 
 use crate::{
     iterators::{merge_iterator::MergeIterator, StorageIterator},
@@ -17,7 +19,16 @@ pub struct LsmIterator {
 
 impl LsmIterator {
     pub(crate) fn new(iter: LsmIteratorInner) -> Result<Self> {
-        Ok(Self { inner: iter })
+        let mut it = Self { inner: iter };
+        it.move_to_non_delete()?;
+        Ok(it)
+    }
+
+    fn move_to_non_delete(&mut self) -> Result<()> {
+        while self.is_valid() && self.value().is_empty() {
+            self.inner.next()?;
+        }
+        Ok(())
     }
 }
 
@@ -25,19 +36,21 @@ impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.inner.is_valid()
     }
 
     fn key(&self) -> &[u8] {
-        unimplemented!()
+        self.inner.key().into_inner()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.inner.value()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        self.inner.next()?;
+        self.move_to_non_delete()?;
+        Ok(())
     }
 }
 
@@ -65,18 +78,40 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         Self: 'a;
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.has_errored && self.iter.is_valid()
     }
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        if !self.is_valid() {
+            panic!("invalid iterator");
+        }
+        self.iter.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        if !self.is_valid() {
+            panic!("invalid iterator");
+        }
+        self.iter.value()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        // if invalid already; return an error
+        if self.has_errored {
+            bail!("invalid iterator");
+        }
+
+        // [NOTE BY CHENHAO]
+        // what if self.iter is not valid but not errored? is that possible? if not, why need to check is_valid?
+        // this means, if self.iter starts with an invalid state, every next() will return Ok without any error
+        if self.iter.is_valid() {
+            // for the first time advancing into the invalid state, mark has_errored
+            if let Err(e) = self.iter.next() {
+                self.has_errored = true;
+                return Err(e);
+            }
+        }
+
+        Ok(())
     }
 }
